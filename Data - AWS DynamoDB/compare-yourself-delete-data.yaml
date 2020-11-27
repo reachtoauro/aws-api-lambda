@@ -1,0 +1,21 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: 'AWS::Serverless-2016-10-31'
+Description: An AWS Serverless Specification template describing your function.
+Resources:
+  compareyourselfdeletedata:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Handler: index.handler
+      Runtime: nodejs12.x
+      CodeUri: .
+      Description: ''
+      MemorySize: 128
+      Timeout: 3
+      Role: >-
+        arn:aws:iam::401193013846:role/service-role/compare-yourself-delete-data-role-13zfz2r2
+      Events:
+        Api1:
+          Type: Api
+          Properties:
+            Path: /compare-yourself
+            Method: DELETE
