@@ -2,7 +2,7 @@
   "swagger": "2.0",
   "info": {
     "description": "Compare Yourself",
-    "version": "2020-11-27T05:40:08Z",
+    "version": "2020-11-27T22:14:03Z",
     "title": "compare-yourself"
   },
   "host": "lx4y6ry53k.execute-api.us-east-1.amazonaws.com",
@@ -34,22 +34,50 @@
             "description": "200 response",
             "schema": {
               "$ref": "#/definitions/Empty"
+            },
+            "headers": {
+              "Access-Control-Allow-Origin": {
+                "type": "string"
+              }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "compare-yourself-user-pool": []
+          }
+        ]
       },
       "delete": {
         "produces": [
           "application/json"
+        ],
+        "parameters": [
+          {
+            "name": "accessToken",
+            "in": "query",
+            "required": true,
+            "type": "string"
+          }
         ],
         "responses": {
           "200": {
             "description": "200 response",
             "schema": {
               "$ref": "#/definitions/Empty"
+            },
+            "headers": {
+              "Access-Control-Allow-Origin": {
+                "type": "string"
+              }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "compare-yourself-user-pool": []
+          }
+        ]
       },
       "options": {
         "consumes": [
@@ -93,6 +121,12 @@
             "in": "path",
             "required": true,
             "type": "string"
+          },
+          {
+            "name": "accessToken",
+            "in": "query",
+            "required": true,
+            "type": "string"
           }
         ],
         "responses": {
@@ -100,9 +134,19 @@
             "description": "200 response",
             "schema": {
               "$ref": "#/definitions/Empty"
+            },
+            "headers": {
+              "Access-Control-Allow-Origin": {
+                "type": "string"
+              }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "compare-yourself-user-pool": []
+          }
+        ]
       },
       "options": {
         "consumes": [
@@ -131,6 +175,14 @@
           }
         }
       }
+    }
+  },
+  "securityDefinitions": {
+    "compare-yourself-user-pool": {
+      "type": "apiKey",
+      "name": "Authorization",
+      "in": "header",
+      "x-amazon-apigateway-authtype": "cognito_user_pools"
     }
   },
   "definitions": {
