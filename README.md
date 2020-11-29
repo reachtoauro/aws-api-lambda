@@ -63,7 +63,7 @@ remove your service `serverless remove`
 - Deploying Lambda Functions (with SAM and even automated!): http://docs.aws.amazon.com/lambda/latest/dg/deploying-lambda-apps.html
 
 ## Testing
-using localstack
+using localstack - https://github.com/atlassian/localstack
 
 # Languages Used
 - Node.js
@@ -99,6 +99,12 @@ Reference - API Gateway basic auth lambda function - https://docs.aws.amazon.com
 - AWS Lambda => https://aws.amazon.com/lambda/?nc2=h_m1
 - AWS Lambda Developer Documentation: http://docs.aws.amazon.com/lambda/latest/dg/welcome.html
 - AWS Lambda pricing: https://aws.amazon.com/lambda/pricing/
+
+# Brief
+- Created DynamoDB table and build necessary IAM roles, policies
+- Created Lambda functions to interact with DynamoDB table and store, retrieve and delete data
+- Created roles and policies to access those Labda functions from API Gateway
+- Create set of APIs in API Gateway and public website to retrieve information from DynamoDB via Lambda functions 
 
 # Achievements
 
@@ -177,13 +183,12 @@ Hooked with AWS CloudFront distribution
 `npm build --prod` to create deployable web application and then you'll find the contents inside build directory
 
 ## Coming soon
- AWS SNS - Sent notifications
- AWS SES - Send emails
- AWS SQS - Messaging Queues
- AWS Step functions - State management
- AWS Kinesis - stream data
- AWS IAM - access control
- AWS Clouwatch - logging and scheduling
- AWS Codebuild - automatic code building
- AWS Code pipeline - continous integration & delivery
- 
+ AWS SNS - Sent notifications - https://aws.amazon.com/sns/
+ AWS SES - Send emails - https://aws.amazon.com/ses/
+ AWS SQS - Messaging Queues - https://aws.amazon.com/sqs/
+ AWS Step functions - State management - https://aws.amazon.com/step-functions/
+ AWS Kinesis - stream data - https://aws.amazon.com/kinesis/
+ AWS IAM - access control 
+ AWS Clouwatch - logging and scheduling - https://aws.amazon.com/cloudwatch/
+ AWS Codebuild - automatic code building - https://aws.amazon.com/codebuild/
+ AWS Code pipeline - continous integration & delivery - https://aws.amazon.com/codepipeline

@@ -1,0 +1,112 @@
+{
+    "AWSTemplateFormatVersion": "2010-09-09",
+    "Metadata": {
+        "AWS::CloudFormation::Designer": {
+            "e63b742f-55fb-4acc-9f7a-350d2ad58161": {
+                "size": {
+                    "width": 60,
+                    "height": 60
+                },
+                "position": {
+                    "x": 214,
+                    "y": 75
+                },
+                "z": 0,
+                "embeds": []
+            }
+        }
+    },
+    "Resources": {
+        "ServerInstance": {
+            "Type": "AWS::EC2::Instance",
+            "Properties": {
+                "InstanceType": {
+                    "Ref": "InstanceType"
+                },
+                "ImageId": {
+                    "Fn::FindInMap": [
+                        "AWSRegionToAMI",
+                        {
+                            "Ref": "AWS::Region"
+                        },
+                        "AMI"
+                    ]
+                }
+            },
+            "Metadata": {
+                "AWS::CloudFormation::Designer": {
+                    "id": "e63b742f-55fb-4acc-9f7a-350d2ad58161"
+                }
+            }
+        }
+    },
+    "Parameters": {
+        "InstanceType": {
+            "Description": "Server EC2 instance type",
+            "Type": "String",
+            "Default": "t3.micro",
+            "AllowedValues": [
+                "t3.micro",
+                "t2.micro"
+            ],
+            "ConstraintDescription": "must be a valid EC2 instance type."
+        }
+    },
+    "Mappings": {
+        "AWSRegionToAMI": {
+            "us-east-1": {
+                "AMI": "ami-c58c1dd3"
+            },
+            "us-east-2": {
+                "AMI": "ami-4191b524"
+            },
+            "us-west-1": {
+                "AMI": "ami-7a85a01a"
+            },
+            "us-west-2": {
+                "AMI": "ami-4836a428"
+            },
+            "ca-central-1": {
+                "AMI": "ami-0bd66a6f"
+            },
+            "eu-west-1": {
+                "AMI": "ami-01ccc867"
+            },
+            "eu-west-2": {
+                "AMI": "ami-b6daced2"
+            },
+            "eu-central-1": {
+                "AMI": "ami-b968bad6"
+            },
+            "sa-east-1": {
+                "AMI": "ami-37cfad5b"
+            },
+            "ap-southeast-1": {
+                "AMI": "ami-fc5ae39f"
+            },
+            "ap-southeast-2": {
+                "AMI": "ami-162c2575"
+            },
+            "ap-south-1": {
+                "AMI": "ami-52c7b43d"
+            },
+            "ap-northeast-1": {
+                "AMI": "ami-923d12f5"
+            },
+            "ap-northeast-2": {
+                "AMI": "ami-9d15c7f3"
+            }
+        }
+    },
+    "Outputs": {
+        "PublicIP": {
+            "Value": {
+                "Fn::GetAtt": [
+                    "ServerInstance",
+                    "PublicIp"
+                ]
+            },
+            "Description": "Newly created server IP address"
+        }
+    }
+}
