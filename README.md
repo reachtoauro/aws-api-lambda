@@ -69,6 +69,7 @@ using localstack - https://github.com/atlassian/localstack
 - Node.js
 - Angular
 - JSON
+- Python
 
 ## AWS API Gateway
 
@@ -182,13 +183,36 @@ Hooked with AWS CloudFront distribution
 `npm start` to run the server locally for development
 `npm build --prod` to create deployable web application and then you'll find the contents inside build directory
 
+## AWS SNS
+https://aws.amazon.com/sns/
+
+- Topic creation
+- Subscription creation
+
+## AWS Clouwatch
+https://aws.amazon.com/cloudwatch/
+
+- Rule creation
+- Alarm creation
+
+## AWS Polly
+https://docs.aws.amazon.com/polly/
+
+- Text to Speech conversion
+
+## Step Function
+
+## Amazon SQS
+
+## Amazon Rekognition
+
+
+
 ## Coming soon
- AWS SNS - Sent notifications - https://aws.amazon.com/sns/
  AWS SES - Send emails - https://aws.amazon.com/ses/
  AWS SQS - Messaging Queues - https://aws.amazon.com/sqs/
  AWS Step functions - State management - https://aws.amazon.com/step-functions/
  AWS Kinesis - stream data - https://aws.amazon.com/kinesis/
  AWS IAM - access control 
- AWS Clouwatch - logging and scheduling - https://aws.amazon.com/cloudwatch/
  AWS Codebuild - automatic code building - https://aws.amazon.com/codebuild/
  AWS Code pipeline - continous integration & delivery - https://aws.amazon.com/codepipeline
