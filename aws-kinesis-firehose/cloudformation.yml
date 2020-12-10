@@ -1,0 +1,399 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: SPL28 - Introduction to Amazon Kinesis Firehose
+
+Parameters:
+
+  AdministratorPassword:
+    Type: String
+    NoEcho: True
+
+  Windows2019BaseAMIID:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-windows-latest/Windows_Server-2019-English-Full-Base
+
+Resources:
+
+  LabVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: Lab VPC
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref LabVPC
+      InternetGatewayId: !Ref InternetGateway
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    DependsOn: AttachGateway
+    Properties:
+      VpcId: !Ref LabVPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs
+      Tags:
+        - Key: Name
+          Value: Public Subnet
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    DependsOn: PublicSubnet
+    Properties:
+      VpcId: !Ref LabVPC
+      Tags:
+        - Key: Name
+          Value: Public Route Table
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn: PublicRoute
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  ElasticSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SecurityGroup for Elasticsearch
+      VpcId: !Ref LabVPC
+      SecurityGroupIngress: 
+        - FromPort: 443
+          IpProtocol: tcp 
+          ToPort: 443 
+          CidrIp: 0.0.0.0/0
+        - FromPort: 80
+          IpProtocol: tcp 
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - FromPort: 3389
+          IpProtocol: tcp 
+          ToPort: 3389
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: ElasticSecurityGroup
+
+  Ec2Instance:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Count: '1'
+        Timeout: PT15M
+    Metadata:
+        AWS::CloudFormation::Init:
+          config:
+            commands:
+              1-Change-Password:
+                command: !Sub net user Administrator "${AdministratorPassword}"
+                waitAfterCompletion: 0
+              2-Disable-IE-ESC:
+                command: REG ADD "HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Active Setup\Installed Components\{A509B1A7-37EF-4b3f-8CFC-4F3A74704073}" /v IsInstalled /t REG_DWORD /d 0 /f
+                waitAfterCompletion: 0
+              3-Disable-IE-First-Run:
+                command: REG ADD "HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Internet Explorer\Main" /v DisableFirstRunCustomize /t REG_DWORD /d 1 /f
+                waitAfterCompletion: 0
+    Properties:
+      ImageId: !Ref Windows2019BaseAMIID
+      Tags:
+        - Key: Name
+          Value: Windows Server
+      InstanceType: t3.medium
+      NetworkInterfaces:
+        - DeviceIndex: "0"
+          AssociatePublicIpAddress: true
+          SubnetId: !Ref PublicSubnet
+          GroupSet:
+            - !Ref ElasticSecurityGroup
+      UserData:
+        Fn::Base64:
+          !Sub |
+            <script>
+            cfn-init.exe -v -s ${AWS::StackName} -r Ec2Instance --region ${AWS::Region}
+            cfn-signal.exe -e %ERRORLEVEL% --stack ${AWS::StackId} --resource Ec2Instance --region ${AWS::Region}
+            </script>
+
+  CreateSLRs:
+    Type: Custom::CreateSLRs
+    Properties:
+      ServiceToken: !GetAtt CreateSLRsFunction.Arn
+      ServiceNames:
+        es.amazonaws.com: AWSServiceRoleForAmazonElasticsearchService
+
+  CreateSLRsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CreateSLRs
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 180
+      Role: !GetAtt CreateSLRsRole.Arn
+      Runtime: python3.7
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import urllib3
+
+          http = urllib3.PoolManager()
+          iam_client = boto3.client("iam")
+          iam_resource = boto3.resource("iam")
+
+          def send_response(event, context, status, reason, data):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": reason,
+                  "PhysicalResourceId": context.log_stream_name,
+                  "StackId": event.get("StackId"),
+                  "RequestId": event.get("RequestId"),
+                  "LogicalResourceId": event.get("LogicalResourceId"),
+                  "NoEcho": False,
+                  "Data": data
+              })
+
+              http.request(
+                  "PUT",
+                  event.get("ResponseURL"),
+                  body=body,
+                  headers={
+                      "Content-Type": "",
+                      "Content-Length": str(len(body))
+                  }
+              )
+
+          def delete_resources(name):
+              role = iam_resource.Role(name=name)
+
+              for role_policy in role.policies.all():
+                  role_policy.delete()
+
+              role.delete()
+
+              boto3.client("lambda").delete_function(FunctionName=name)
+
+          def handler(event, context):
+              try:
+                  # Only handle 'Create' requests.
+                  if event.get("RequestType") == "Create":
+                      for (service_name, service_role) in event.get("ResourceProperties").get("ServiceNames").items():
+                          if next((role for role in iam_resource.roles.all() if role.name == service_role), None) is None:
+                              iam_client.create_service_linked_role(
+                                  AWSServiceName=service_name
+                              )
+                      send_response(event, context, "SUCCESS", "Service Linked Roles Available", {})
+                  else:
+                      send_response(event, context, "SUCCESS", "No Action Performed", {})
+              except Exception as exception:
+                  send_response(event, context, "FAILED", str(exception), {})
+              finally:
+                delete_resources(event.get("LogicalResourceId"))
+
+  CreateSLRsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CreateSLRs
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+      Policies:
+        - PolicyName: CreateSLRs
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - iam:ListRoles
+                Effect: Allow
+                Resource:
+                  - "*"
+              - Action:
+                  - iam:CreateServiceLinkedRole
+                Effect: Allow
+                Resource:
+                  - arn:aws:iam::*:role/aws-service-role/*
+              - Action:
+                  - iam:DeleteRole
+                  - iam:DeleteRolePolicy
+                  - iam:ListRolePolicies
+                Effect: Allow
+                Resource:
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/CreateSLRs
+              - Action:
+                  - lambda:DeleteFunction
+                Effect: Allow
+                Resource:
+                  - !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:CreateSLRs
+
+  ElasticsearchDomain:
+    Type: AWS::Elasticsearch::Domain
+    DependsOn: CreateSLRs
+    Properties:
+      DomainName: stocks
+      ElasticsearchVersion: '5.3'
+      ElasticsearchClusterConfig:
+        DedicatedMasterEnabled: false
+        InstanceCount: 1
+        InstanceType: m5.large.elasticsearch
+        ZoneAwarenessEnabled: false
+      EBSOptions:
+        EBSEnabled: true
+        Iops: 0
+        VolumeSize: 10
+        VolumeType: standard
+      SnapshotOptions:
+        AutomatedSnapshotStartHour: 0
+      DomainEndpointOptions:
+        EnforceHTTPS: true
+      AccessPolicies:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: '*'
+            Action: es:ESHttp*
+            Resource: '*'
+      VPCOptions: 
+        SubnetIds:
+          - !Ref PublicSubnet
+        SecurityGroupIds: 
+          - !Ref ElasticSecurityGroup
+      AdvancedOptions:
+        rest.action.multi.allow_explicit_index: 'true'
+
+  LabFirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: Lab-Firehose-Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - firehose.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: Lab-Firehose-Policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: S3
+                Effect: Allow
+                Action:
+                  - s3:Get*
+                  - s3:List*
+                  - s3:PutObject
+                  - lambda:InvokeFunction
+                  - lambda:GetFunctionConfiguration
+                  - es:*
+                  - logs:PutLogEvents
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                  - kinesis:Describe*
+                  - kinesis:Get*
+                  - kinesis:List*
+                  - ec2:Describe*
+                  - ec2:CreateNetworkInterface
+                  - ec2:CreateNetworkInterfacePermission
+                  - ec2:Describe*
+                  - ec2:DeleteNetworkInterface
+                Resource:
+                  - '*'
+  LabLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: Lab-Lambda-Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: mypolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:*
+                Resource:
+                  - '*'
+  LabBucket:
+    Type: AWS::S3::Bucket
+
+  ReadOnlyGroup:
+    Type: AWS::IAM::Group
+    Properties:
+      GroupName: QLReadOnly
+      ManagedPolicyArns: [ "arn:aws:iam::aws:policy/ReadOnlyAccess" ]
+  GroupAssignment:
+    Type: AWS::IAM::UserToGroupAddition
+    DependsOn: ReadOnlyGroup
+    Properties:
+      GroupName: QLReadOnly
+      Users:
+        - awsstudent
+
+  ElasticStreamRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - es.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - !Ref ElasticStreamManagedPolicy
+
+  ElasticStreamManagedPolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ElasticVPCPermissions
+            Effect: Allow
+            Action:
+              - 'ec2:CreateNetworkInterface'
+              - 'ec2:DeleteNetworkInterface'
+              - 'ec2:DescribeNetworkInterfaces'
+              - 'ec2:ModifyNetworkInterfaceAttribute'
+              - 'ec2:DescribeSecurityGroups'
+              - 'ec2:DescribeSubnets'
+              - 'ec2:DescribeVpcs'
+            Resource: "*"
+
+Outputs:
+
+  AdministratorPassword:
+    Value: !Ref AdministratorPassword
+
+  WindowsHost:
+    Description: Public IP of EC2 instance
+    Value: !GetAtt Ec2Instance.PublicIp

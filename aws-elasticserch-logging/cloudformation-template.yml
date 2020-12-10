@@ -1,0 +1,1081 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: (SPL237) - Centralized Log Processing with Amazon Elasticsearch Service
+
+# Parameters used in these asset creation
+Parameters:
+  # Name for ES Domain (setup by student)
+  DomainName:
+    Description: Name for the Amazon ES domain that this template will create. Domain names must start with a lowercase letter and must be between 3 and 28 characters. Valid characters are a-z (lowercase only), 0-9.
+    Type: String
+    Default: loganalysiswithes
+
+  KeyName:
+    Description: EC2 KeyPair to enable SSH access to the instances
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: must be the name of an existing EC2 KeyPair.
+  InstanceType:
+    Description: Amazon EC2 instance type
+    Type: String
+    Default: t2.small
+    AllowedValues:
+     - t2.micro
+     - t2.small
+     - t2.medium
+     - t3.medium
+     - m4.large
+    ConstraintDescription: must be a valid EC2 instance type.
+  VPCCIDR:
+    Description: 'CIDR Block for VPC (Do Not Edit)'
+    Type: String
+    Default: 10.25.0.0/16
+  PUBSUBNETA:
+    Description: 'Public Subnet A (Do Not Edit)'
+    Type: String
+    Default: 10.25.1.0/24
+  PUBSUBNETB:
+    Description: 'Public Subnet B (Do Not Edit)'
+    Type: String
+    Default: 10.25.2.0/24
+  PRIVSUBNETA:
+    Description: 'Private Subnet (Do Not Edit)'
+    Type: String
+    Default: 10.25.3.0/24
+  PRIVSUBNETB:
+    Description: 'Private Subnet (Do Not Edit)'
+    Type: String
+    Default: 10.25.4.0/24
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+  LatestWinAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-windows-latest/Windows_Server-2019-English-Full-Base'
+  SSMKey :
+    Description: Name of parameter store which contains the json configuration of CWAgent.
+    Type : String
+    Default: ConfigParamForSPL237
+  ClTrailLogGroup:
+    Description: Name of parameter store which contains the json configuration of CWAgent.
+    Type : String
+    Default: CloudTrailLogGroup
+
+Resources:
+  CustomResourceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CustomResourceRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: CFNCustomResource
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: [ 'iam:ListRoles',
+                          'iam:CreateServiceLinkedRole',
+                          'iam:DeleteServiceLinkedRole',
+                          'logs:CreateLogGroup',
+                          'logs:CreateLogStream',
+                          'logs:PutLogEvents' ]
+                Resource: '*'
+  CustomResourceLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ES-ServiceLinkedRoleCreation
+      Description: Used to see if a Service Linked Role is already present in the lab account, If not it will create one for the lab
+      Handler: lambda.handler
+      Role: !GetAtt CustomResourceRole.Arn
+      Code:
+        S3Bucket: us-west-2-aws-training
+        S3Key: awsu-spl/spl-237/1.1.5.prod/scripts/CustomResource-SourceCode.zip
+      Runtime: python3.6
+      Timeout: 180
+  ServiceLinkedRoleSetup:
+    Type: 'Custom::ServiceLinkedRoleSetup'
+    DependsOn:
+      - CustomResourceRole
+    Properties:
+      ServiceToken: !GetAtt CustomResourceLambda.Arn
+
+  # Creates a user pool in cognito to auth against
+  UserPool:
+    Type: 'AWS::Cognito::UserPool'
+    Properties:
+      UserPoolName: !Sub ${DomainName}_kibana_access
+      AutoVerifiedAttributes:
+        - email
+      MfaConfiguration: 'OFF'
+      EmailVerificationSubject: !Ref AWS::StackName
+      Schema:
+        - Name: name
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+        - Name: email
+          AttributeDataType: String
+          Mutable: false
+          Required: true
+
+  # Creates a needed group in Cognito for Kibana access
+  UserPoolGroup:
+    Type: "AWS::Cognito::UserPoolGroup"
+    Properties:
+      Description: 'User pool group for Kibana access'
+      GroupName: !Sub ${DomainName}_kibana_access_group
+      Precedence: 0
+      UserPoolId: !Ref UserPool
+
+  # Creates a User Pool Client to be used by the identity pool
+  UserPoolClient:
+    Type: 'AWS::Cognito::UserPoolClient'
+    Properties:
+      ClientName: !Sub ${DomainName}-client
+      GenerateSecret: false
+      UserPoolId: !Ref UserPool
+
+  # Creates a federated Identity pool
+  IdentityPool:
+    Type: 'AWS::Cognito::IdentityPool'
+    Properties:
+      IdentityPoolName: !Sub ${DomainName}Identity
+      AllowUnauthenticatedIdentities: true
+      CognitoIdentityProviders:
+        - ClientId: !Ref UserPoolClient
+          ProviderName: !GetAtt UserPool.ProviderName
+
+  # Create a role for authorized access to AWS resources.
+  # Only allows users in the previously created Identity Pool
+  CognitoAuthorizedRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Federated: 'cognito-identity.amazonaws.com'
+            Action:
+              - 'sts:AssumeRoleWithWebIdentity'
+            Condition:
+              StringEquals:
+                'cognito-identity.amazonaws.com:aud': !Ref IdentityPool
+              'ForAnyValue:StringLike':
+                'cognito-identity.amazonaws.com:amr': authenticated
+      Policies:
+        - PolicyName: 'CognitoAuthorizedPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'cognito-sync:BulkPublish'
+                  - 'cognito-sync:DescribeIdentityPoolUsage'
+                  - 'cognito-sync:GetBulkPublishDetails'
+                  - 'cognito-sync:GetCognitoEvents'
+                  - 'cognito-sync:GetIdentityPoolConfiguration'
+                  - 'cognito-sync:ListIdentityPoolUsage'
+                  - 'cognito-sync:SetCognitoEvents'
+                  - 'congito-sync:SetIdentityPoolConfiguration'
+                  - 'cognito-identity:DeleteIdentityPool'
+                  - 'cognito-identity:DescribeIdentityPool'
+                  - 'cognito-identity:GetIdentityPoolRoles'
+                  - 'cognito-identity:GetOpenIdTokenForDeveloperIdentity'
+                  - 'cognito-identity:ListIdentities'
+                  - 'cognito-identity:LookupDeveloperIdentity'
+                  - 'cognito-identity:MergeDeveloperIdentities'
+                  - 'cognito-identity:UnlikeDeveloperIdentity'
+                  - 'cognito-identity:UpdateIdentityPool'
+                Resource: !Sub 'arn:aws:cognito-identity:${AWS::Region}:${AWS::AccountId}:identitypool/${IdentityPool}'
+
+  CognitoESAccessRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: CognitoAccessForAmazonES
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonESCognitoAccess
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'es.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+
+  # Assigns the roles to the Identity Pool
+  IdentityPoolRoleMapping:
+    Type: 'AWS::Cognito::IdentityPoolRoleAttachment'
+    Properties:
+      IdentityPoolId: !Ref IdentityPool
+      Roles:
+        authenticated: !GetAtt CognitoAuthorizedRole.Arn
+
+  LambdaESCognito:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Description: Centralized Logging - Lambda function to enable cognito authentication for kibana
+      Environment:
+        Variables:
+          LOG_LEVEL: 'INFO'
+      Handler: index.handler
+      Runtime: nodejs12.x
+      Timeout: 180
+      Role: !GetAtt LambdaESCognitoRole.Arn
+      Code:
+        S3Bucket: us-west-2-aws-training
+        S3Key: awsu-spl/spl-237/1.1.5.prod/scripts/clog-auth.zip
+
+
+  LambdaESCognitoRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: arn:aws:logs:*:*:*
+          - Effect: Allow
+            Action:
+            - es:UpdateElasticsearchDomainConfig
+            Resource: !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${DomainName}'
+          - Effect: Allow
+            Action:
+            - cognito-idp:CreateUserPoolDomain
+            - cognito-idp:DeleteUserPoolDomain
+            Resource: !GetAtt UserPool.Arn
+          - Effect: Allow
+            Action:
+            - iam:PassRole
+            Resource: !GetAtt CognitoESAccessRole.Arn
+
+  # Log Streamer and Demo resources
+  LogStreamerRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: LogStreamerRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: !Sub logstreamer-${AWS::Region}
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+            - Effect: Allow
+              Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*
+            - Effect: Allow
+              Action:
+              - es:ESHttpPost
+              Resource: !Sub arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/*
+
+
+  ### Networkign Section ###
+  # Defining the VPC Used for this lab, it contains two public subnet
+  VPC:
+    Type: 'AWS::EC2::VPC'
+    #DependsOn: ServiceLinkedRoleSetup
+    Properties:
+      CidrBlock: !Ref VPCCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: 'Log Analytics - VPC'
+
+  # Users will hit EC2 instances which are running in the public subnets.
+  InternetGateway:
+    Type: 'AWS::EC2::InternetGateway'
+    DependsOn: VPC
+    Properties:
+      Tags:
+        - Key: Name
+          Value: 'Log Analytics - IGW'
+  # Attached this IGW to the VPC
+  AttachGateway:
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # This will host a sample web app running in Linux based EC2 instance 1.
+  PublicSubnetA:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PUBSUBNETA
+      AvailabilityZone: !Select
+        - '0'
+        - !GetAZs ''
+      Tags:
+        - Key: Name
+          Value: 'Log Analytics - Public Subnet A'
+
+  # This will host a sample web app running in Linux based EC2 instance 2.
+  PublicSubnetB:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PUBSUBNETB
+      AvailabilityZone: !Select
+        - '1'
+        - !GetAZs ''
+      Tags:
+        - Key: Name
+          Value: 'Log Analytics - Public Subnet B'
+
+  PrivateSubnetA:
+    Type: 'AWS::EC2::Subnet'
+    DependsOn:
+      - ServiceLinkedRoleSetup
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PRIVSUBNETA
+      AvailabilityZone: !Select
+        - '0'
+        - !GetAZs ''
+      Tags:
+        - Key: Name
+          Value: 'Log Analytics - Private Subnet A'
+
+  PrivateSubnetB:
+    Type: 'AWS::EC2::Subnet'
+    DependsOn:
+      - ServiceLinkedRoleSetup
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PRIVSUBNETB
+      AvailabilityZone: !Select
+        - '1'
+        - !GetAZs ''
+      Tags:
+        - Key: Name
+          Value: 'Log Analytics - Private Subnet B'
+
+  # Define the Public Routing Table
+  PublicRouteTable:
+    Type: 'AWS::EC2::RouteTable'
+    DependsOn:
+      - AttachGateway
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: 'Public-VPC Rout Table'
+
+  #Private Route table
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+       - Key: Name
+         Value: Private-VPC Route Table
+
+  # And add in the default route to 0.0.0.0/0
+  PublicRouteIGW:
+    Type: 'AWS::EC2::Route'
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # Attach the routing table to each of the subnets
+  PublicRouteTableAssociationA:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+  PublicRouteTableAssociationB:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTableAssociationA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnetA
+  PrivateRouteTableAssociationB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnetB
+
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable HTTP access via port 80 and SSH access via port 22
+      VpcId:
+        !Ref 'VPC'
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: udp
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: 0.0.0.0/0
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 3389
+          ToPort: 3389
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: Web-SG
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lambda to access ES cluster
+      VpcId:
+        !Ref 'VPC'
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: udp
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: 0.0.0.0/0
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: Lambda-SG
+
+  ESSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable access to ES cluster within VPC CIDRs
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref VPCCIDR
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VPCCIDR
+      Tags:
+        - Key: Name
+          Value: ES-SG
+
+  # Custom resource to configure Cognito and ES
+  SetupESCognito:
+    Type: 'Custom::SetupESCognito'
+    DependsOn:
+      - ElasticsearchAWSLogs
+    Version: 1.0
+    Properties:
+      ServiceToken: !GetAtt LambdaESCognito.Arn
+      Domain: !Ref DomainName
+      CognitoDomain: !Sub ${DomainName}-${AWS::AccountId}
+      UserPoolId: !Ref UserPool
+      IdentityPoolId: !Ref IdentityPool
+      RoleArn: !GetAtt CognitoESAccessRole.Arn
+# Moved this to a Custom Resource
+#  ESServiceRole:
+#     Type: AWS::IAM::ServiceLinkedRole
+#     Properties:
+#       AWSServiceName: "es.amazonaws.com"
+#       Description: "Service linked role for Amazon ES"
+
+  ##Create Amazon ES Cluster
+  ElasticsearchAWSLogs:
+    Type: AWS::Elasticsearch::Domain
+    Properties:
+      DomainName: !Ref DomainName
+      ElasticsearchVersion: '6.7'
+      EncryptionAtRestOptions:
+        Enabled: true
+      ElasticsearchClusterConfig:
+        #DedicatedMasterEnabled: true
+        InstanceCount: 2
+        ZoneAwarenessEnabled: true
+        InstanceType: i3.large.elasticsearch
+        #DedicatedMasterType: c4.large.elasticsearch
+        #DedicatedMasterCount: 3
+      SnapshotOptions:
+        AutomatedSnapshotStartHour: 1
+      AccessPolicies:
+        Version: 2012-10-17
+        Statement:
+        - Action: 'es:*'
+          Principal:
+            AWS: !Sub
+              - arn:aws:sts::${AWS::AccountId}:assumed-role/${AuthRole}/CognitoIdentityCredentials
+              - { AuthRole: !Ref CognitoAuthorizedRole }
+          Effect: Allow
+          Resource: !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${DomainName}/*'
+        - Action: 'ec2:*'
+          Principal:
+            Service: es.amazonaws.com
+          Effect: Allow
+          Resource: 'arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+      VPCOptions:
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+        SecurityGroupIds:
+          - !Ref ESSecurityGroup
+      AdvancedOptions:
+        rest.action.multi.allow_explicit_index: 'true'
+        indices.fielddata.cache.size: '40'
+
+
+  VPCFlowLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: 'Allow'
+          Principal:
+            Service:
+            - vpc-flow-logs.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: '/'
+      Policies:
+      - PolicyName: VPCFlowLogPolicy-SPL237
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action: [ 'logs:CreateLogGroup',
+                      'logs:CreateLogStream',
+                      'logs:DescribeLogGroups',
+                      'logs:DescribeLogStreams',
+                      'logs:PutLogEvents' ]
+            Resource: '*'
+
+  CloudTrailRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: 'Allow'
+          Principal:
+            Service:
+            - cloudtrail.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: '/'
+      Policies:
+      - PolicyName: CloudTrailPolicy-SPL237
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action: [ 'logs:CreateLogGroup',
+                      'logs:CreateLogStream',
+                      'logs:DescribeLogGroups',
+                      'logs:DescribeLogStreams',
+                      'logs:PutLogEvents' ]
+            Resource: '*'
+
+  ### IAM Section ###
+  EC2SSMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: 'Allow'
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: '/'
+      Policies:
+      - PolicyName: EC2SSMRolePolicy-SPL237
+        PolicyDocument:
+          Statement:
+          - Effect:  'Allow'
+            Action: [ 'ssm:Describe*',
+                      'ssm:Get*',
+                      'ssm:List*',
+                      'ssm:PutInventory',
+                      'ssm:PutComplianceItems',
+                      'ssm:PutConfigurePackageResult',
+                      'ssm:UpdateAssociationStatus',
+                      'ssm:UpdateInstanceAssociationStatus',
+                      'ssm:UpdateInstanceInformation',
+                      'ec2:DescribeInstanceStatus',
+                      'ec2messages:AcknowledgeMessage',
+                      'ec2messages:DeleteMessage',
+                      'ec2messages:FailMessage',
+                      'ec2messages:GetEndpoint',
+                      'ec2messages:GetMessages',
+                      'ec2messages:SendReply',
+                      'ec2:DescribeTags',
+                      'cloudwatch:PutMetricData',
+                      'cloudwatch:*',
+                      'ds:CreateComputer',
+                      'ds:DescribeDirectories',
+                      'logs:CreateLogGroup',
+                      'logs:CreateLogStream',
+                      'logs:DescribeLogGroups',
+                      'logs:DescribeLogStreams',
+                      'logs:PutLogEvents',
+                      's3:PutObject',
+                      's3:GetObject',
+                      's3:AbortMultipartUpload',
+                      's3:ListMultipartUploadParts',
+                      's3:ListBucket',
+                      's3:ListBucketMultipartUploads']
+            Resource: '*'
+
+  EC2SSMInstProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+      - Ref: EC2SSMRole
+
+  ## Windows EC2 host
+  WindowsEC2Host:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - PublicSubnetB
+    Properties:
+      InstanceType: t3.large
+      ImageId: !Ref LatestWinAmiId
+      KeyName: !Ref KeyName
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeleteOnTermination: true
+          DeviceIndex: '0'
+          GroupSet:
+            - !Ref WebSecurityGroup
+          SubnetId: !Ref PublicSubnetA
+      Tags:
+       - Key: 'Name'
+         Value: 'Windows Bastion Host'
+      #Installing Chrome browser
+      UserData:
+        'Fn::Base64':
+          !Sub |
+            <powershell>
+               $LocalTempDir = $env:TEMP; $ChromeInstaller = "ChromeInstaller.exe"; (new-object System.Net.WebClient).DownloadFile('http://dl.google.com/chrome/install/375.126/chrome_installer.exe', "$LocalTempDir\$ChromeInstaller"); & "$LocalTempDir\$ChromeInstaller" /silent /install; $Process2Monitor =  "ChromeInstaller"; Do { $ProcessesFound = Get-Process | ?{$Process2Monitor -contains $_.Name} | Select-Object -ExpandProperty Name; If ($ProcessesFound) { "Still running: $($ProcessesFound -join ', ')" | Write-Host; Start-Sleep -Seconds 2 } else { rm "$LocalTempDir\$ChromeInstaller" -ErrorAction SilentlyContinue -Verbose } } Until (!$ProcessesFound)
+
+               C:\"Program Files"\Amazon\cfn-bootstrap\cfn-signal.exe -e %ERRORLEVEL% --stack ${AWS::StackId} --resource WindowsEC2Host --region ${AWS::Region}
+            </powershell>
+
+  ### Create two EC2 Instances with simple web app ###
+  #Linux EC2 host1
+  LinuxEC2Host1:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - VPC
+      - ConfigParamForEC2s
+    Properties:
+      KeyName: !Ref KeyName
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref EC2SSMInstProfile
+      NetworkInterfaces:
+      - DeviceIndex: "0"
+        AssociatePublicIpAddress: true
+        SubnetId: !Ref PublicSubnetA
+        GroupSet:
+          - !Ref WebSecurityGroup
+      Tags:
+       - Key: 'Name'
+         Value: 'LinuxEC2Host 1'
+       - Key: 'SecurityScan'
+         Value: 'false'
+       - Key: 'OS Group'
+         Value: 'AmazonLinux'
+      UserData:
+        'Fn::Base64':
+          !Sub |
+            #!/bin/bash -ex
+            #update with latest patches
+            sudo yum update -y
+
+            #go to ec2-user direcotry
+            cd /home/ec2-user
+
+            #Download and install CL agents
+            wget https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm
+            yum -y install amazon-cloudwatch-agent.rpm
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c ssm:${SSMKey} -s
+            sudo systemctl enable amazon-cloudwatch-agent
+            sudo systemctl start amazon-cloudwatch-agent
+
+            # Install httpd Server with a simple page
+            sudo yum install httpd -y
+
+            curl -o /home/ec2-user/index.html https://us-west-2-aws-training.s3.amazonaws.com/awsu-spl/spl-237/1.1.5.prod/scripts/index.html
+            #curl -o /home/ec2-user/index.html https://us-west-2-aws-training.s3.amazonaws.com/awsu-spl/spl-237/1.1.5.prod/scripts/index.html
+
+            sudo mv index.html /var/www/html
+            sudo /usr/sbin/apachectl start
+            sudo chmod 755 /var/log/httpd
+
+            #web_load.py - is a small pythin script which makes calls to both web servers during the cron job call, this is to add load on the web servers for more log data collection.
+            curl -o /home/ec2-user/web_load.py https://us-west-2-aws-training.s3.amazonaws.com/awsu-spl/spl-237/1.1.5.prod/scripts/web_load.py
+            #curl -o /home/ec2-user/web_load.py https://us-west-2-aws-training.s3.amazonaws.com/awsu-spl/spl-237/1.1.5.prod/scripts/web_load.py
+
+
+            # - { ssmkey: !Ref SSMKey }
+            #/opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackName} --resource LinuxEC2Host --region ${AWS::Region}\
+            ec2url=`curl http://169.254.169.254/latest/meta-data/public-hostname`
+
+            echo "#!/bin/bash -ex
+            python /home/ec2-user/web_load.py http://$ec2url/ http://$ec2url/" >> /home/ec2-user/load.sh
+
+            sudo chmod +x /home/ec2-user/load.sh
+
+            echo "*/1 * * * * /home/ec2-user/load.sh >> /home/ec2-user/cron.log 2>&1
+            */1 * * * * sleep 10; /home/ec2-user/load.sh >> /home/ec2-user/cron.log 2>&1
+            */1 * * * * sleep 20; /home/ec2-user/load.sh >> /home/ec2-user/cron.log 2>&1
+            */1 * * * * sleep 30; /home/ec2-user/load.sh >> /home/ec2-user/cron.log 2>&1
+            */1 * * * * sleep 40; /home/ec2-user/load.sh >> /home/ec2-user/cron.log 2>&1
+            */1 * * * * sleep 50; /home/ec2-user/load.sh >> /home/ec2-user/cron.log 2>&1" >> /home/ec2-user/cron.job
+
+            #This is the cron job activated via crontab. This job runs every minute but inside the script it makes web call for every 10 seconds.
+            #Start the cron job
+            crontab /home/ec2-user/cron.job
+
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource LinuxEC2Host1 --region ${AWS::Region}\
+
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: "PT15M"
+        Count: 1
+
+  #Linux EC2 host1
+  LinuxEC2Host2:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - LinuxEC2Host1
+    Properties:
+      KeyName: !Ref KeyName
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref EC2SSMInstProfile
+      NetworkInterfaces:
+      - DeviceIndex: "0"
+        AssociatePublicIpAddress: true
+        SubnetId: !Ref PublicSubnetB
+        GroupSet:
+          - !Ref WebSecurityGroup
+      Tags:
+       - Key: 'Name'
+         Value: 'LinuxEC2Host 2'
+       - Key: 'SecurityScan'
+         Value: 'false'
+       - Key: 'OS Group'
+         Value: 'AmazonLinux'
+      UserData:
+        'Fn::Base64':
+          !Sub |
+            #!/bin/bash -ex
+
+            #update with latest patches
+            sudo yum update -y
+
+            #go to ec2-user direcotry
+            cd /home/ec2-user
+
+            # download and install cloudwatch agent
+            wget https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm
+            yum -y install amazon-cloudwatch-agent.rpm
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c ssm:${SSMKey} -s
+            sudo systemctl enable amazon-cloudwatch-agent
+            sudo systemctl start amazon-cloudwatch-agent
+
+            # Install httpd Server with a simple page
+            sudo yum install httpd -y
+
+
+            curl -o /home/ec2-user/index.html https://us-west-2-aws-training.s3.amazonaws.com/awsu-spl/spl-237/1.1.5.prod/scripts/index.html
+            #curl -o /home/ec2-user/index.html https://us-west-2-aws-training.s3.amazonaws.com/awsu-spl/spl-237/1.1.5.prod/scripts/index.html
+
+            sudo mv index.html /var/www/html
+            sudo /usr/sbin/apachectl start
+            sudo chmod 755 /var/log/httpd
+
+            #web_load.py - is a small pythin script which makes calls to both web servers during the cron job call, this is to add load on the web servers for more log data collection.
+            curl -o /home/ec2-user/web_load.py https://us-west-2-aws-training.s3.amazonaws.com/awsu-spl/spl-237/1.1.5.prod/scripts/scripts/web_load.py
+            #curl -o /home/ec2-user/web_load.py https://us-west-2-aws-training.s3.amazonaws.com/awsu-spl/spl-237/1.1.5.prod/scripts/web_load.py
+
+
+            #/opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackName} --resource LinuxEC2Host --region ${AWS::Region}\
+            ec2url=`curl http://169.254.169.254/latest/meta-data/public-hostname`
+
+            echo "#!/bin/bash -ex
+            python /home/ec2-user/web_load.py http://$ec2url/ http://${LinuxEC2Host1.PublicDnsName}/" >> /home/ec2-user/load.sh
+
+            sudo chmod +x /home/ec2-user/load.sh
+
+
+            #Install nmap and brute force attack script.
+            #!/bin/bash -xe
+            export PATH=$PATH:/usr/local/bin:/usr/sbin:/root/.local/bin
+            echo 'export PATH=/root/.local/bin:/usr/sbin:$PATH' >> /home/ec2-user/.profile
+            yum install nmap git python python2-pip python-argparse gcc gcc-c++ glib2-devel -y
+            yum install cmake openssl-devel libX11-devel libXi-devel libXtst-devel libXinerama-devel -y
+            pip install paramiko
+            export privateIP=`curl http://169.254.169.254/latest/meta-data/local-ipv4`
+            curl -o /home/ec2-user/hacker_script.sh -0 https://us-west-2-aws-training.s3.amazonaws.com/awsu-spl/spl-237/1.1.5.prod/scripts/hacker_script.sh
+            mkdir /home/ec2-user/compromised_keys
+            mkdir /home/ec2-user/domains
+            mkdir /home/ec2-user/passwords
+            curl -o /home/ec2-user/domains/queries.txt -0 https://us-west-2-aws-training.s3.amazonaws.com/awsu-spl/spl-237/1.1.5.prod/scripts/queries.txt
+            curl -o /home/ec2-user/passwords/password_list.txt -0 https://us-west-2-aws-training.s3.amazonaws.com/awsu-spl/spl-237/1.1.5.prod/scripts/password_list.txt
+            curl -o /home/ec2-user/compromised_keys/compromised.pem -0 https://us-west-2-aws-training.s3.amazonaws.com/awsu-spl/spl-237/1.1.5.prod/scripts/never_used_sample_key.foo
+            FILE="/home/ec2-user/compromised_keys/compromised.pem"
+            for FILE in {1..20}; do cp /home/ec2-user/compromised_keys/compromised.pem /home/ec2-user/compromised_keys/compromised$FILE.pem; done
+            echo 'BASIC_LINUX_TARGET=${LinuxEC2Host1.PrivateIp}' >> /home/ec2-user/localIps.sh
+            echo -n 'RED_TEAM_INSTANCE="' >> /home/ec2-user/localIps.sh
+            wget -q -O - http://169.254.169.254/latest/meta-data/instance-id >> /home/ec2-user/localIps.sh
+            echo '"' >> /home/ec2-user/localIps.sh
+            echo -n 'RED_TEAM_IP="' >> /home/ec2-user/localIps.sh
+            wget -q -O - http://169.254.169.254/latest/meta-data/local-ipv4 >> /home/ec2-user/localIps.sh
+            echo '"' >> /home/ec2-user/localIps.sh
+            echo 'BASIC_LINUX_INSTANCE=${LinuxEC2Host1}' >> /home/ec2-user/localIps.sh
+            curl -o /home/ec2-user/crowbar.zip -0 https://us-west-2-aws-training.s3.amazonaws.com/awsu-spl/spl-237/1.1.5.prod/scripts/crowbar.zip
+            unzip /home/ec2-user/crowbar.zip -d /home/ec2-user
+            chown -R ec2-user:ec2-user /home/ec2-user
+            chmod +x /home/ec2-user/hacker_script.sh
+            chmod +x /home/ec2-user/localIps.sh
+            chmod +x /home/ec2-user/crowbar/crowbar.py
+
+            #echo '*/1 * * * * root sudo su -l -c /home/ec2-user/hacker_script.sh ec2-user >> /home/ec2-user/hacker.log 2>&1' > /etc/cron.d/CompromisedServer
+            echo "*/1 * * * * /home/ec2-user/load.sh >> /home/ec2-user/cron.log 2>&1
+            */1 * * * * sleep 10; /home/ec2-user/load.sh >> /home/ec2-user/cron.log 2>&1
+            */1 * * * * sleep 20; /home/ec2-user/load.sh >> /home/ec2-user/cron.log 2>&1
+            */1 * * * * sleep 30; /home/ec2-user/load.sh >> /home/ec2-user/cron.log 2>&1
+            */1 * * * * sleep 40; /home/ec2-user/load.sh >> /home/ec2-user/cron.log 2>&1
+            */1 * * * * sleep 50; /home/ec2-user/load.sh >> /home/ec2-user/cron.log 2>&1
+            */1 * * * * /home/ec2-user/hacker_script.sh >> /home/ec2-user/hacker.log 2>&1" >> /home/ec2-user/cron.job
+
+            #hacker script scheduler
+            #echo -n "*/1 * * * * /home/ec2-user/hacker_script.sh >> /home/ec2-user/hacker.log 2>&1" >> /home/ec2-user/cron.job
+            crontab /home/ec2-user/cron.job
+
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource LinuxEC2Host2 --region ${AWS::Region}\
+
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: "PT15M"
+        Count: 1
+
+  #Configure log groups
+  ConfigParamForEC2s:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: !Ref SSMKey
+      Description: "SSM Parameter for storing the agent config file"
+      Type: "String"
+      Value: '{
+          "agent": {
+            "metrics_collection_interval": 10
+          },
+          "logs": {
+            "logs_collected": {
+              "files": {
+                "collect_list": [
+                  {
+                    "file_path": "/var/log/httpd/access_log",
+                    "log_group_name": "AccessLogGroup",
+                    "log_stream_name": "{instance_id}/http.log",
+                    "timezone": "Local"
+                  },
+                  {
+                    "file_path": "/var/log/secure",
+                    "log_group_name": "SSHLogGroup",
+                    "log_stream_name": "{instance_id}/ssh.log",
+                    "timezone": "Local"
+                  }
+                ]
+              }
+            }
+          }
+        }'
+
+  # logging Bucket for SSM
+  LogBucket:
+    Type: AWS::S3::Bucket
+
+  # Bucket Policy
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DependsOn:
+    - LogBucket
+    Properties:
+      Bucket:
+        Ref: LogBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Sid: "AWSCloudTrailAclCheck"
+            Effect: "Allow"
+            Principal:
+              Service: "cloudtrail.amazonaws.com"
+            Action: "s3:GetBucketAcl"
+            Resource:
+              !Sub |-
+                arn:aws:s3:::${LogBucket}
+          -
+            Sid: "AWSCloudTrailWrite"
+            Effect: "Allow"
+            Principal:
+              Service: "cloudtrail.amazonaws.com"
+            Action: "s3:PutObject"
+            Resource:
+              !Sub |-
+                arn:aws:s3:::${LogBucket}/*
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: "bucket-owner-full-control"
+
+  CloudTrailLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName : !Ref ClTrailLogGroup
+
+  #Cloud Trails
+  CloudTrailLogs:
+    Type: AWS::CloudTrail::Trail
+    DependsOn:
+    - BucketPolicy
+    Properties:
+        CloudWatchLogsLogGroupArn: !GetAtt 'CloudTrailLogGroup.Arn'
+        CloudWatchLogsRoleArn: !GetAtt 'CloudTrailRole.Arn'
+        IncludeGlobalServiceEvents: true
+        IsLogging: true
+        IsMultiRegionTrail: false
+        S3BucketName: !Ref LogBucket
+        S3KeyPrefix: "cltraillogs"
+
+  VPCFlowLog:
+    Type: 'AWS::EC2::FlowLog'
+    Properties:
+      DeliverLogsPermissionArn: !GetAtt 'VPCFlowLogsRole.Arn'
+      LogGroupName: 'VPCFlowLogGroup'
+      ResourceId: !Ref VPC
+      ResourceType: 'VPC'
+      TrafficType: 'ALL'
+
+  #DynamoDB table
+  CourseTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: CourseId
+          AttributeType: S
+        - AttributeName: CourseType
+          AttributeType: S
+      KeySchema:
+        - AttributeName: CourseId
+          KeyType: HASH
+        - AttributeName: CourseType
+          KeyType: RANGE
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      TableName: Courses
+
+  ReadOnlyGroup:
+    Type: AWS::IAM::Group
+    Properties:
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/ReadOnlyAccess
+
+  GroupAssignment:
+    Type: AWS::IAM::UserToGroupAddition
+    Properties:
+      GroupName: !Ref ReadOnlyGroup
+      Users:
+        - awsstudent
+
+Outputs:
+  WebServer1Url:
+    Value:
+      !Sub 'http://${LinuxEC2Host1.PublicDnsName}'
+    Description: URL for Web server 1
+
+  WebServer2Url:
+    Value:
+      !Sub 'http://${LinuxEC2Host2.PublicDnsName}'
+    Description: URL for Web server 2
+
+  LambdaSourceCode:
+    Description: Source Code for Lambda log index function
+    Value: https://us-west-2-aws-training.s3.amazonaws.com/awsu-spl/spl-237/1.1.5.prod/scripts/indexing-service.zip
+
+  LogStreamerRole:
+    Description: Log Stream Role for Lambda
+    Value: !Sub ${LogStreamerRole}
+
+  ESEndpoint:
+    Description: ES Domain Endpoint
+    Value: !Sub https://${ElasticsearchAWSLogs.DomainEndpoint}
+
+  KibanaLoginURL:
+    Description: Kibana login URL
+    Value: !Sub https://${ElasticsearchAWSLogs.DomainEndpoint}/_plugin/kibana/
